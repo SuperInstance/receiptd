@@ -1,0 +1,4 @@
+receiptd-pinrun*/
+receiptd-diag*/
+__pycache__/
+*.sock
