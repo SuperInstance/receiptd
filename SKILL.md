@@ -48,6 +48,40 @@ connection survives.
 - The daemon's index is a VIEW — if someone appends to the file directly,
   `stats`/`by-corr` may lag until restart; `verify` never lies (re-derives).
 
+## Slice 1.5 LIVE — tipnotary (external memory, 2026-10-02)
+
+`verify` proves a chain is SELF-consistent. A full-file rewrite with every hash
+recomputed is self-consistent too — verify passes and the forgery walks.
+Demonstrated live: 23 receipts rewritten+re-derived → `verify` = `verified:true`.
+That is verify's limit; tipnotary is the closure.
+
+```sh
+python3 tipnotary.py notarize        # verify → tip → KV PUT anchor → GET byte-readback → receipt
+python3 tipnotary.py check           # rc=0 MATCH | rc=3 STALE (legit growth; re-notarize) | rc=2 FORGED (named)
+SI_STATE_DIR=./test-tipnotary python3 tipnotary.py kill-trial --rounds 20
+SI_STATE_DIR=./test-tipnotary python3 tipnotary.py forge-test --i-know-this-rewrites-the-chain
+TIPNOTARY_KEY=test/tip python3 pins_tipnotary.py   # 9/9 pins, LIVE KV, isolated key/dir
+```
+
+- **Anchor** = canonical JSON `{chain, h, seq, notarized_at, notary, prev_anchor_h,
+  hash_spec:{fn,encoding,unit,rule}, key}` at KV key `si/tip` (config: flag > env >
+  `~/.config/tipnotary/config.json`; token read at use-time, never stored).
+- **hash_spec anchors the SPELLING** — ours is `sha256/utf-8/bytes`; a distant cousin
+  chain (quilt-dba's fnv1a64) hashes UTF-16 charCodeAt. Same names, different bytes.
+  The spec field makes the difference machine-checkable, per the wardroom byte-mandate.
+- **Verb taxonomy (slice 1.5)**: `built` / `planned` / `d12-forced` split — a plan and a
+  build never share a verb; `notarize` receipts carry `evidence.anchored_h` so the
+  writer's claim is re-derivable from KV (the self-check rider, embodied).
+- **Check is three-valued like v**: MATCH / STALE / FORGED — a gate that can't say
+  STALE will lie to you.
+- **T5 is the load-bearing pin**: forgery must pass `verify` AND fail `check`. If T5
+  goes red the notary is decoration.
+- Gotchas: the receipt changes the tip it anchored (assert seq advance, not hash
+  equality — third bite of convention-by-construction); pins must use an isolated
+  TIPNOTARY_KEY or they clobber the production anchor; CF KV keys need `%2F` encoding
+  on the wire (`si/tip`); the new CF token's account differs from old wrangler.toml
+  `account_id` — resolve the account from `/accounts`, not from stale tomls.
+
 ## Slice 2 (the road)
 
 - `receipt verify-exec <hash>` — spawn champion_audit in a sandbox lane, write

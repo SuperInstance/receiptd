@@ -32,7 +32,8 @@ STORE = STATE_DIR / "receipts.jsonl"
 SOCK = STATE_DIR / "receiptd.sock"
 GENESIS = "0" * 64
 VALID_VERBS = {"ask", "answer", "gist", "interrupt", "handoff", "receipt",
-               "pin", "audit", "demote", "note"}
+               "pin", "audit", "demote", "note",
+               "notarize", "built", "planned", "d12-forced"}
 
 
 def canonical(obj):
