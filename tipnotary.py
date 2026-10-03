@@ -37,7 +37,7 @@ Config order: --flag > env > ~/.config/tipnotary/config.json
   {account_id, namespace_id};  token: env CF_API_TOKEN else key.txt at use-time.
 Key: si/tip (URL-encoded si%2Ftip on the wire).
 """
-import argparse, json, os, sys, time, urllib.error, urllib.request
+import argparse, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 import receiptd as R
@@ -136,6 +136,46 @@ def rec_at_seq(seq):
     return None
 
 
+def i2i_token():
+    p = Path.home() / ".config/i2i/i2i-token"
+    t = p.read_text().strip() if p.exists() else ""
+    if not t:
+        die("no i2i token at ~/.config/i2i/i2i-token (twin mode)")
+    return t
+
+
+def i2i_curl(method, path, body=None):
+    """i2i MUST go through curl — Cloudflare 403s urllib (error 1010, lesson in memory)."""
+    tok = i2i_token()
+    cmd = ["curl", "-s", "-m", "30",
+           "https://i2i-ledger.casey-digennaro.workers.dev" + path,
+           "-H", f"Authorization: Bearer {tok}"]
+    if body is not None:
+        cmd += ["-X", method, "-H", "Content-Type: application/json", "-d", json.dumps(body)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"i2i curl failed rc={r.returncode}: {r.stderr[:150]}")
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        die(f"i2i curl returned non-JSON: {r.stdout[:150]}")
+
+
+def i2i_book(gist, receipt_url, books_to):
+    out = i2i_curl("POST", "/book", {"agent": "lucineer", "gist": gist,
+                                      "receipt_url": receipt_url, "books_to": books_to})
+    if not out.get("ok") or not out.get("id"):
+        die(f"i2i book refused: {json.dumps(out)[:200]}")
+    return out["id"]
+
+
+def i2i_near(q):
+    try:
+        return i2i_curl("GET", "/near?q=" + urllib.parse.quote(q, safe=""))
+    except SystemExit:
+        return {"error": "near failed"}
+
+
 def do_check(acct, ns, tok, key, quiet=False):
     ok, info = R.verify_chain()
     if not ok:
@@ -177,12 +217,24 @@ def do_check(acct, ns, tok, key, quiet=False):
         print(f"TIPNOTARY CHECK stale tip=seq{tip_seq} anchor=seq{a['seq']} "
               f"unanchored={unanchored} — re-run notarize")
         sys.exit(3)
+    twin_state = ""
+    w = a.get("i2i_witness")
+    if w:
+        hits = i2i_near(tip_h[:24])
+        rows = hits.get("results") or hits.get("hits") or hits.get("rows") or []
+        found = any(json.dumps(r).find(tip_h[:24]) >= 0 or r.get("id") == w.get("id") for r in rows)
+        if found:
+            twin_state = " twin=confirmed"
+        else:
+            twin_state = " twin=unverified(search)"  # informational; ledger row remains the witness
+        if not w.get("id"):
+            die("FORGED: anchor claims i2i witness but carries no witness id")
     if not quiet:
-        print(f"TIPNOTARY CHECK match tip=seq{tip_seq} anchor=seq{a['seq']}")
+        print(f"TIPNOTARY CHECK match tip=seq{tip_seq} anchor=seq{a['seq']}{twin_state}")
     return a
 
 
-def do_notarize(acct, ns, tok, key):
+def do_notarize(acct, ns, tok, key, twin=False):
     ok, info = R.verify_chain()
     if not ok:
         die(f"chain verify FAILED, refusing to anchor a broken chain: {info}")
@@ -194,10 +246,18 @@ def do_notarize(acct, ns, tok, key):
             prev_h = json.loads(prev_body).get("h")
         except json.JSONDecodeError:
             prev_h = "UNPARSEABLE"
+    witness = None
+    if twin:
+        wid = i2i_book(
+            f"receiptd tip anchor seq={tip_seq} h={tip_h[:24]} (sha256-utf8; twin witness of KV {key})",
+            "https://github.com/SuperInstance/receiptd", "tipnotary")
+        witness = {"id": wid, "booked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     anchor = {"chain": "receiptd", "h": tip_h, "seq": tip_seq,
               "notarized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "notary": "tipnotary-1", "prev_anchor_h": prev_h, "hash_spec": HASH_SPEC,
               "key": key}
+    if witness:
+        anchor["i2i_witness"] = witness
     val = R.canonical(anchor)
     st, body = kv(acct, ns, tok, "PUT", key, value=val)
     if st not in (200, 201):
@@ -208,11 +268,14 @@ def do_notarize(acct, ns, tok, key):
     if back != val:
         die(f"KV readback != write (PUT {len(val)}B, GET {len(back)}B) — KV not telling the truth")
     rec = R.append_rec({"lane": "tipnotary", "corr": f"anchor-{tip_seq}", "verb": "notarize",
-                        "claim": f"anchored tip {tip_h[:12]}… seq={tip_seq} in KV ns={ns} key={key} kv=match",
+                        "claim": f"anchored tip {tip_h[:12]}… seq={tip_seq} in KV ns={ns} key={key} kv=match"
+                                 + (f" twin=i2i:{witness['id'][:8]}…" if witness else ""),
                         "v": 1,
                         "evidence": {"anchored_h": tip_h, "anchored_seq": tip_seq,
-                                     "prev_anchor_h": prev_h, "kv_readback": "exact-match"}})
-    print(f"TIPNOTARY OK seq={tip_seq} kv=match receipt=seq{rec['seq']}")
+                                     "prev_anchor_h": prev_h, "kv_readback": "exact-match",
+                                     **({"i2i_witness": witness} if witness else {})}})
+    print(f"TIPNOTARY OK seq={tip_seq} kv=match receipt=seq{rec['seq']}"
+          + (f" twin={witness['id'][:8]}…" if witness else ""))
     return anchor
 
 
@@ -280,6 +343,7 @@ def main():
     ap.add_argument("--account-id")
     ap.add_argument("--namespace-id")
     ap.add_argument("--key", help=f"KV key (default {DEFAULT_KEY})")
+    ap.add_argument("--twin", action="store_true", help="also book the anchor into the i2i ledger (second witness, second domain)")
     ap.add_argument("--rounds", type=int, default=20, help="kill-trial rounds")
     ap.add_argument("--i-know-this-rewrites-the-chain", action="store_true")
     args = ap.parse_args()
@@ -291,7 +355,7 @@ def main():
     acct, ns, key = load_config(args)
     tok = load_token()
     if args.cmd == "notarize":
-        sys.exit(do_notarize(acct, ns, tok, key) and 0)
+        sys.exit(do_notarize(acct, ns, tok, key, twin=args.twin) and 0)
     if args.cmd == "check":
         do_check(acct, ns, tok, key)
     if args.cmd == "kill-trial":
