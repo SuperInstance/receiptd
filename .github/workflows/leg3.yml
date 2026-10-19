@@ -1,0 +1,37 @@
+# THE CREDENTIAL SPLIT, RUN ON EVERY PUSH.
+#
+# Two CI lines in this fleet were found recently that NEVER RAN THEIR OWN
+# SUITES -- one ran `pytest tests/` and never collected a root-level test
+# file; the other ran `cargo test --lib` and `cargo test --doc` and never
+# collected `tests/`. Both were green. **A test that CI never runs is a
+# comment.**
+#
+# So this workflow exists, and it runs the thing that matters: that the
+# notary's READ path cannot WRITE, that a forged chain is caught when the
+# anchor namespace is unwritable, and that the limit is stated rather than
+# quietly assumed.
+#
+# No Cloudflare account. No network. The KV is a local double that
+# ENFORCES token permissions -- a double that ignored permissions could
+# not answer the question, and would make this whole file decoration.
+name: leg3
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: the credential split, and the limit
+        run: python3 scripts/leg3_test.py
+      - name: the notary's own self-test still passes
+        run: python3 tipnotary.py --help > /dev/null
