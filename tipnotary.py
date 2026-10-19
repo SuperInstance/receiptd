@@ -36,6 +36,29 @@ Kill criteria (pre-registered, from the wardroom cross-hearing):
 Config order: --flag > env > ~/.config/tipnotary/config.json
   {account_id, namespace_id};  token: env CF_API_TOKEN else key.txt at use-time.
 Key: si/tip (URL-encoded si%2Ftip on the wire).
+
+THE CREDENTIAL SPLIT -- and the limit that makes it mean something.
+------------------------------------------------------------------
+This anchor closes the third leg: a chain that re-derives proves only
+self-consistency, so a full rewrite with recomputed hashes ALSO verifies.
+An external anchor catches that -- but only if the person rewriting the
+chain CANNOT rewrite the anchor. **The account is the unit of control.**
+
+So the two verbs are two credentials:
+
+  NOTARIZE (PUT)  TIPNOTARY_WRITE_TOKEN / CF_API_TOKEN. The NOTARY holds it.
+  CHECK    (GET)  TIPNOTARY_READ_TOKEN, and it is OPTIONAL -- a
+                  public-read namespace needs no credential at all.
+
+A verifier that can only GET cannot rewrite the anchor, so it cannot be
+tricked into agreeing with a forgery. **A verifier that holds BOTH can, and
+then the anchor proves nothing.** That is not a bug in this file; it is the
+shape of the property. The fleet's own census found that NOTHING in the
+fleet holds the third leg, and this is the smallest build that would.
+
+Run the split against a local KV double that ENFORCES the permissions:
+  python3 scripts/fake_kv.py --port 8781
+  TIPNOTARY_KV_BASE=http://127.0.0.1:8781 python3 scripts/leg3_test.py
 """
 import argparse, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
@@ -43,6 +66,10 @@ from pathlib import Path
 import receiptd as R
 
 DEFAULT_KEY = "si/tip"  # override: --key / env TIPNOTARY_KEY / config.json "key"
+# The KV API base. Overridable so the whole notary can be exercised against a
+# LOCAL double that ENFORCES token permissions -- which is the only way to
+# PROVE the credential split rather than assert it.
+KV_BASE = os.environ.get("TIPNOTARY_KV_BASE", "https://api.cloudflare.com/client/v4").rstrip("/")
 HASH_SPEC = {
     "fn": "sha256", "encoding": "utf-8", "unit": "bytes",
     "rule": "h = sha256(h_prev + '\\n' + canonical(rec minus h))",
@@ -70,25 +97,60 @@ def load_config(args):
     return acct, ns, key
 
 
-def load_token():
-    tok = os.environ.get("CF_API_TOKEN", "").strip()
-    if tok:
-        return tok
-    for line in Path("/mnt/c/Users/casey/key.txt").read_text().splitlines():
+def load_token(role="write"):
+    """The credential for one role.
+
+    write  TIPNOTARY_WRITE_TOKEN, else CF_API_TOKEN, else key.txt. REQUIRED:
+           a notary that cannot write cannot notarize.
+    read   TIPNOTARY_READ_TOKEN, else CF_API_TOKEN, else key.txt, else None.
+           OPTIONAL: a public-read namespace needs no credential, and a
+           verifier that holds no write credential is exactly the property
+           the anchor depends on.
+
+    **THE READ ROLE FALLS BACK TO THE WRITE TOKEN ONLY AS A LAST RESORT**,
+    and `leg3_test.py` asserts that a read performed with the WRITE token
+    still cannot PUT -- because the split is enforced by the credential's
+    permissions, not by which variable a token came from."""
+    if role == "read":
+        for var in ("TIPNOTARY_READ_TOKEN", "TIPNOTARY_WRITE_TOKEN", "CF_API_TOKEN"):
+            tok = os.environ.get(var, "").strip()
+            if tok:
+                return tok
+        for line in _key_file_lines():
+            if line.startswith("TIPNOTARY_READ_TOKEN"):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+        return None            # public read
+    for var in ("TIPNOTARY_WRITE_TOKEN", "CF_API_TOKEN"):
+        tok = os.environ.get(var, "").strip()
+        if tok:
+            return tok
+    for line in _key_file_lines():
         if line.startswith("CF_API_TOKEN"):
             tok = line.split("=", 1)[1].strip().strip('"').strip("'")
-            break
-    if not tok:
-        die("no CF_API_TOKEN (env empty, key.txt line missing/empty)")
-    return tok
+            if tok:
+                return tok
+    die("no write token (TIPNOTARY_WRITE_TOKEN / CF_API_TOKEN empty, key.txt line missing/empty)")
+
+
+def _key_file_lines():
+    p = Path("/mnt/c/Users/casey/key.txt")
+    try:
+        return p.read_text().splitlines()
+    except OSError:
+        return []
 
 
 def kv(acct, ns, tok, method, key, value=None):
-    url = f"https://api.cloudflare.com/client/v4/accounts/{acct}/storage/kv/namespaces/{ns}/values/{urllib.parse.quote(key, safe='')}"
+    """One KV call. `tok` may be None: a public-read namespace needs NO
+    credential, and that is the whole point of the split -- a verifier that
+    cannot write cannot be coerced into agreeing with a forgery."""
+    url = f"{KV_BASE}/accounts/{acct}/storage/kv/namespaces/{ns}/values/{urllib.parse.quote(key, safe='')}"
+    headers = {"Content-Type": "application/json"}
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
     req = urllib.request.Request(url, method=method,
                                  data=value.encode() if value is not None else None,
-                                 headers={"Authorization": f"Bearer {tok}",
-                                          "Content-Type": "application/json"})
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.status, r.read().decode()
@@ -343,6 +405,7 @@ def main():
     ap.add_argument("--account-id")
     ap.add_argument("--namespace-id")
     ap.add_argument("--key", help=f"KV key (default {DEFAULT_KEY})")
+    ap.add_argument("--kv-base", help="KV API base (default the real Cloudflare; point it at scripts/fake_kv.py to exercise the credential split offline)")
     ap.add_argument("--twin", action="store_true", help="also book the anchor into the i2i ledger (second witness, second domain)")
     ap.add_argument("--rounds", type=int, default=20, help="kill-trial rounds")
     ap.add_argument("--i-know-this-rewrites-the-chain", action="store_true")
@@ -352,16 +415,22 @@ def main():
         R.STATE_DIR = Path(args.state_dir)
         R.STORE = R.STATE_DIR / "receipts.jsonl"
         R.SOCK = R.STATE_DIR / "receiptd.sock"
+    global KV_BASE
+    if args.kv_base:
+        KV_BASE = args.kv_base.rstrip("/")
     acct, ns, key = load_config(args)
-    tok = load_token()
+    # THE SPLIT: a notarize needs the WRITE credential, a check needs only
+    # a READ one -- and a read-only credential CANNOT PUT, so a verifier
+    # that holds only the read credential cannot be coerced into agreeing
+    # with a forgery.
     if args.cmd == "notarize":
-        sys.exit(do_notarize(acct, ns, tok, key, twin=args.twin) and 0)
+        sys.exit(do_notarize(acct, ns, load_token("write"), key, twin=args.twin) and 0)
     if args.cmd == "check":
-        do_check(acct, ns, tok, key)
+        do_check(acct, ns, load_token("read"), key)
     if args.cmd == "kill-trial":
-        sys.exit(do_kill_trial(acct, ns, tok, key, max(1, args.rounds)))
+        sys.exit(do_kill_trial(acct, ns, load_token("write"), key, max(1, args.rounds)))
     if args.cmd == "forge-test":
-        sys.exit(do_forge(acct, ns, tok, key))
+        sys.exit(do_forge(acct, ns, load_token("write"), key))
 
 
 if __name__ == "__main__":
